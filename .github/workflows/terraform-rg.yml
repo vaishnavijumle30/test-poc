@@ -1,0 +1,101 @@
+
+name: Terraform RG (Reusable)
+
+on:
+  workflow_call:
+    inputs:
+      rg_name:
+        description: "Resource group module folder under infra/resource-groups (e.g., rg-app, rg-data)"
+        required: true
+        type: string
+      environment:
+        description: "Environment/workspace (e.g., dev, prod)"
+        required: true
+        type: string
+        default: dev
+      auto_approve:
+        description: "Apply automatically without manual approval"
+        required: false
+        type: boolean
+        default: false
+    secrets:
+      AZURE_CLIENT_ID:
+        required: true
+      AZURE_TENANT_ID:
+        required: true
+      AZURE_SUBSCRIPTION_ID:
+        required: true
+
+jobs:
+  terraform:
+    name: "Deploy ${{ inputs.rg_name }} to ${{ inputs.environment }}"
+    runs-on: ubuntu-latest
+
+    permissions:
+      id-token: write   # for OIDC to Azure
+      contents: read
+
+    env:
+      TF_IN_AUTOMATION: true
+      TF_WORKING_DIR: infra/resource-groups/${{ inputs.rg_name }}
+      TFVARS_FILE: ../../envs/${{ inputs.environment }}.tfvars
+      ARM_USE_OIDC: true
+      ARM_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+      ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+      ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.6.6
+
+      - name: Terraform Init
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform init
+
+      - name: Terraform Fmt (check)
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform fmt -check
+
+      - name: Terraform Validate
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform validate
+
+      - name: Select/Create Workspace
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        shell: bash
+        run: |
+          terraform workspace list
+          terraform workspace new "${{ inputs.environment }}" || true
+          terraform workspace select "${{ inputs.environment }}"
+
+      - name: Terraform Plan
+        id: plan
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          terraform plan \
+            -var-file="${{ env.TFVARS_FILE }}" \
+            -out=tfplan
+
+      - name: Upload Plan (when not auto-approving)
+        if: ${{ !inputs.auto_approve }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.rg_name }}-${{ inputs.environment }}-tfplan
+          path: ${{ env.TF_WORKING_DIR }}/tfplan
+
+      - name: Terraform Apply (auto)
+        if: ${{ inputs.auto_approve }}
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform apply -auto-approve tfplan
